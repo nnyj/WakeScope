@@ -1,4 +1,6 @@
 using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Text;
 
 namespace WakeScope;
 
@@ -20,109 +22,134 @@ public sealed class DisplayBlockerEntry : IDisposable
 
 sealed class PowerRequestMonitor
 {
+    // バッファ構造 (Windows 11 x64 で実測確認済み):
+    //   Header:  [+0x00] uint64 Count
+    //            [+0x08] uint64[Count] Offsets  (バッファ先頭からの各要素オフセット)
+    //   Element: [+0x00] uint64 TypeMarker
+    //            [+0x08] uint64 f1
+    //            [+0x10] uint64 f2   ← DISPLAY アクティブ要求数 (0x3F 型)
+    //            [+0x18] uint64 f3
+    //            [+0x20] uint64 f4
+    //            [+0x28] uint64 f5
+    //            [+0x30] uint64 f6
+    //            [+0x38] uint64 f7   ← PID (経験的に確認・未公式)
+    //            [+0x40] uint64 f8
+    //            [+0x48] WCHAR[] name    (null 終端 UTF-16LE)
+    //                    WCHAR[] reason  (name の直後、null 終端)
+
+    private const ulong TypeMarkerProcess = 0x3F; // ユーザーモードプロセス (DISPLAY/SYSTEM/AwayMode)
+    private const int   OffF2             = 0x10; // DISPLAY アクティブフラグ
+    private const int   OffF7             = 0x38; // PID
+    private const int   OffStrings        = 0x48; // 文字列開始位置
+
     private readonly Icon _fallbackIcon;
 
     public PowerRequestMonitor(Icon fallbackIcon) => _fallbackIcon = fallbackIcon;
 
-    // ── 公開 API ─────────────────────────────────────────────────────────
+    // ── 公開 API ─────────────────────────────────────────────────────────────
 
     public List<DisplayBlockerEntry> GetDisplayBlockers()
     {
-        try
-        {
-            string output = RunPowercfg();
-            return ParseDisplaySection(output);
-        }
-        catch
-        {
-            return [];
-        }
+        try { return QueryDisplayBlockers(); }
+        catch { return []; }
     }
 
-    // ── powercfg 実行 ────────────────────────────────────────────────────
+    // ── API 呼び出し ─────────────────────────────────────────────────────────
 
-    private static string RunPowercfg()
+    private List<DisplayBlockerEntry> QueryDisplayBlockers()
     {
-        var psi = new ProcessStartInfo("powercfg", "/requests")
+        uint size = 16384;
+        while (true)
         {
-            RedirectStandardOutput = true,
-            UseShellExecute        = false,
-            CreateNoWindow         = true,
-        };
-
-        using var proc = Process.Start(psi)
-            ?? throw new InvalidOperationException("Failed to start powercfg.");
-
-        string output = proc.StandardOutput.ReadToEnd();
-        proc.WaitForExit(5000);
-        return output;
-    }
-
-    // ── 出力パース ───────────────────────────────────────────────────────
-
-    // powercfg /requests の出力例:
-    //   DISPLAY:
-    //   [PROCESS] \Device\HarddiskVolume3\...\chrome.exe
-    //   Video Wake Lock
-    //
-    //   SYSTEM:
-    //   None.
-    //
-    // カテゴリヘッダは "UPPERCASE:" 形式。[PROCESS] 行のみ抽出する。
-
-    private List<DisplayBlockerEntry> ParseDisplaySection(string output)
-    {
-        var result = new List<DisplayBlockerEntry>();
-        bool inDisplay = false;
-
-        foreach (string rawLine in output.Split('\n'))
-        {
-            string line = rawLine.TrimEnd('\r', '\n');
-
-            // カテゴリヘッダ判定: "DISPLAY:", "SYSTEM:", "AWAYMODE:" 等
-            if (line.Length > 1 && line.EndsWith(':') &&
-                line[..^1].All(c => char.IsLetterOrDigit(c)))
+            IntPtr buf = Marshal.AllocHGlobal((int)size);
+            try
             {
-                if (inDisplay) break; // DISPLAY セクションを抜けた
-                inDisplay = line.Equals("DISPLAY:", StringComparison.OrdinalIgnoreCase);
-                continue;
+                int status = NativePower.PowerInformationWithPrivileges(
+                    NativePower.PowerRequestListLevel,
+                    IntPtr.Zero, 0, buf, size);
+
+                if (status == NativePower.StatusBufferTooSmall) { size *= 2; continue; }
+                if (status != NativePower.StatusSuccess) return [];
+
+                return ParseDisplayEntries(buf, size);
             }
+            finally
+            {
+                Marshal.FreeHGlobal(buf);
+            }
+        }
+    }
 
-            if (!inDisplay) continue;
+    // ── バッファ解析 ─────────────────────────────────────────────────────────
 
-            // [PROCESS] \Device\... の行だけ処理
-            // [SERVICE] / [DRIVER] / [THREAD] / "None." / 理由行はスキップ
-            if (!line.StartsWith("[PROCESS]", StringComparison.OrdinalIgnoreCase)) continue;
+    private List<DisplayBlockerEntry> ParseDisplayEntries(IntPtr buf, uint bufSize)
+    {
+        ulong count = (ulong)Marshal.ReadInt64(buf, 0);
+        var result  = new List<DisplayBlockerEntry>();
 
-            string ntPath = line["[PROCESS]".Length..].TrimStart();
-            if (ntPath.Length > 0)
-                result.Add(CreateEntry(ntPath));
+        for (ulong i = 0; i < count; i++)
+        {
+            int headerOff = 8 + (int)i * 8;
+            if (headerOff + 8 > (int)bufSize) break;
+
+            ulong elemOff = (ulong)Marshal.ReadInt64(buf, headerOff);
+            if (elemOff + OffStrings + 2 > bufSize) continue;
+
+            IntPtr elem = IntPtr.Add(buf, (int)elemOff);
+
+            ulong typeMarker = (ulong)Marshal.ReadInt64(elem, 0x00);
+            if (typeMarker != TypeMarkerProcess) continue;
+
+            ulong f2 = (ulong)Marshal.ReadInt64(elem, OffF2);
+            if (f2 == 0) continue; // DISPLAY 要求がアクティブでない
+
+            ulong f7 = (ulong)Marshal.ReadInt64(elem, OffF7);
+
+            int maxBytes    = (int)(bufSize - elemOff) - OffStrings;
+            var (ntPath, _) = ReadStringPair(elem, OffStrings, maxBytes);
+
+            string? win32Path = NtPathConverter.ToWin32Path(ntPath);
+            string  fileName  = Path.GetFileName(win32Path ?? ntPath);
+            if (string.IsNullOrEmpty(fileName)) fileName = ntPath;
+
+            uint  pid  = ResolvePid(f7, win32Path);
+            Icon? icon = TryExtractIcon(win32Path) ?? new Icon(_fallbackIcon, 16, 16);
+
+            result.Add(new DisplayBlockerEntry
+            {
+                ProcessId = pid,
+                FileName  = fileName,
+                Icon      = icon,
+            });
         }
 
         return result;
     }
 
-    // ── エントリ生成 ─────────────────────────────────────────────────────
+    // ── PID 解決 ─────────────────────────────────────────────────────────────
 
-    private DisplayBlockerEntry CreateEntry(string ntPath)
+    // f7 に PID が格納されていることを経験的に確認済み (未公式)。
+    // プロセスが実在しパスが一致すれば採用し、そうでなければ名前マッチングにフォールバックする。
+    private static uint ResolvePid(ulong f7Candidate, string? win32Path)
     {
-        string? win32Path = NtPathConverter.ToWin32Path(ntPath);
-        string  fileName  = Path.GetFileName(win32Path ?? ntPath);
-        if (string.IsNullOrEmpty(fileName)) fileName = ntPath;
-
-        uint  pid  = win32Path is not null ? FindPid(win32Path) : 0;
-        Icon? icon = TryExtractIcon(win32Path) ?? new Icon(_fallbackIcon, 16, 16);
-
-        return new DisplayBlockerEntry
+        if (f7Candidate > 0 && f7Candidate <= uint.MaxValue)
         {
-            ProcessId = pid,
-            FileName  = fileName,
-            Icon      = icon,
-        };
+            uint candidate = (uint)f7Candidate;
+            try
+            {
+                using var proc = Process.GetProcessById((int)candidate);
+                if (win32Path is null ||
+                    string.Equals(proc.MainModule?.FileName, win32Path,
+                        StringComparison.OrdinalIgnoreCase))
+                    return candidate;
+            }
+            catch { }
+        }
+
+        return win32Path is not null ? FindPidByPath(win32Path) : 0;
     }
 
-    // プロセス名で絞り込んでから実行パスで照合するので GetProcesses() より高速
-    private static uint FindPid(string win32Path)
+    private static uint FindPidByPath(string win32Path)
     {
         try
         {
@@ -142,6 +169,34 @@ sealed class PowerRequestMonitor
         catch { }
         return 0;
     }
+
+    // ── 文字列読み取り ───────────────────────────────────────────────────────
+
+    private static (string first, string second) ReadStringPair(
+        IntPtr elem, int startOffset, int maxBytes)
+    {
+        int limit  = startOffset + maxBytes;
+        int offset = startOffset;
+        string first  = ReadNullTermWChar(elem, ref offset, limit);
+        string second = ReadNullTermWChar(elem, ref offset, limit);
+        return (first, second);
+    }
+
+    // byteOffset を更新しながら null 終端 WCHAR 文字列を読む
+    private static string ReadNullTermWChar(IntPtr elem, ref int byteOffset, int limit)
+    {
+        var sb = new StringBuilder();
+        while (byteOffset + 1 < limit)
+        {
+            short w = Marshal.ReadInt16(elem, byteOffset);
+            byteOffset += 2;
+            if (w == 0) break;
+            sb.Append((char)w);
+        }
+        return sb.ToString();
+    }
+
+    // ── アイコン取得 ─────────────────────────────────────────────────────────
 
     private static Icon? TryExtractIcon(string? win32Path)
     {

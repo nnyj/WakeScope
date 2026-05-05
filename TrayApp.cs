@@ -140,7 +140,7 @@ sealed class TrayApp : ApplicationContext
         }
 
         _menu.Items.Add(new ToolStripSeparator());
-        var exitItem = new ToolStripMenuItem("終了");
+        var exitItem = new ToolStripMenuItem("Exit");
         exitItem.Click += (_, _) => Application.Exit();
         _menu.Items.Add(exitItem);
     }

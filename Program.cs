@@ -23,6 +23,9 @@ static class Program
             return;
         }
 
+        NativePower.EnablePrivilege("SeShutdownPrivilege");
+        NativePower.EnablePrivilege("SeDebugPrivilege");
+
         ApplicationConfiguration.Initialize();
 
         // WindowsFormsSynchronizationContext を明示的に設定する。
