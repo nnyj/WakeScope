@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <AssemblyName>WakeScope</AssemblyName>
+    <RootNamespace>WakeScope</RootNamespace>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <PlatformTarget>x64</PlatformTarget>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <Optimize>true</Optimize>
+    <ApplicationIcon>icons\exe.ico</ApplicationIcon>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="icons\tray_idle.ico">
+      <LogicalName>WakeScope.icons.tray_idle.ico</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="icons\tray_active.ico">
+      <LogicalName>WakeScope.icons.tray_active.ico</LogicalName>
+    </EmbeddedResource>
+  </ItemGroup>
+
+</Project>
