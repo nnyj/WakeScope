@@ -24,29 +24,25 @@ WakeScope polls `powercfg /requests` every second and signals any culprits via t
 | Item | Requirement |
 |------|-------------|
 | OS | Windows 11 (x64) |
-| Runtime | .NET 8 Desktop Runtime |
+| Runtime | None (self-contained) |
 | Privileges | **Administrator required** (needed to run `powercfg /requests`) |
 
 ## Installation
 
 1. Download and extract the latest zip from the [Releases](https://github.com/130cmWolf/WakeScope/releases) page, or build from source
-2. Place `WakeScope.exe` alongside the `icons/` folder
-3. Right-click `WakeScope.exe` → **Run as administrator**
+2. Right-click `WakeScope.exe` → **Run as administrator**
 
 ### Build from source
+
+.NET 8 SDK is required.
 
 ```bash
 git clone https://github.com/130cmWolf/WakeScope.git
 cd WakeScope
-dotnet build -c Release
+dotnet publish -p:PublishProfile=Release
 ```
 
-After building, place the following icons in the `icons/` folder:
-
-| File | Purpose |
-|------|---------|
-| `icons/tray_idle.ico` | No blockers (green) |
-| `icons/tray_active.ico` | Blocker detected (red) |
+The output is placed at `publish\WakeScope.exe`.
 
 ## Usage
 
