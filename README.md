@@ -52,7 +52,7 @@ dotnet publish -p:PublishProfile=Release
 
 ## 仕組み
 
-`powrprof.dll` の `PowerInformationWithPrivileges`（レベル 45）を1秒ごとに呼び出し、システム全体の電力要求リストをバッファとして取得します。  
+`powrprof.dll` の [`PowerInformationWithPrivileges`](docs/PowerInformationWithPrivileges.md)（レベル 45）を1秒ごとに呼び出し、システム全体の電力要求リストをバッファとして取得します。  
 TypeMarker `0x3F` かつアクティブフラグが 0 でないエントリを DISPLAY ブロッカーとして抽出し、NT パスを Win32 パスに変換してプロセスアイコンと PID を特定します。
 
 ```mermaid
