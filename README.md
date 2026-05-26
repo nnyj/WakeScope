@@ -75,7 +75,7 @@ WakeScope should show same active categories and blockers.
 Test script:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File C:\N\scripts\system\sleep_block_test.ps1 -Mode both
+powershell -ExecutionPolicy Bypass -File .\tests\sleep_block_test.ps1
 ```
 
 ## Notes
