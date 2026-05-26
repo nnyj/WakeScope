@@ -1,62 +1,259 @@
 using System.Diagnostics;
+using System.Management;
 using System.Runtime.InteropServices;
 using System.Text;
 
 namespace WakeScope;
 
-public sealed class DisplayBlockerEntry : IDisposable
+public sealed class PowerRequestEntry : IDisposable
 {
-    public required uint   ProcessId  { get; init; }
-    public required string FileName   { get; init; }
-    public Icon?           Icon       { get; init; }
+    public required string SourceType { get; init; }
+    public required string NativePath { get; init; }
+    public required string DisplayName { get; init; }
+    public required string Reason { get; init; }
+    public required List<string> Categories { get; init; }
+    public uint ProcessId { get; set; }
+    public Icon? Icon { get; init; }
+    public string? ComClassName { get; set; }
+    public string? CommandLine { get; set; }
+    public List<ProcessCandidate> ProcessCandidates { get; } = [];
 
     private bool _disposed;
+
+    public bool BlocksDisplay => Categories.Contains("DISPLAY");
+    public bool BlocksSleep => Categories.Any(static x => x != "DISPLAY");
+
+    public string CategoryText => string.Join(", ", Categories);
+
+    public string DetailText
+    {
+        get
+        {
+            var parts = new List<string> { CategoryText };
+            if (ProcessId != 0) parts.Add($"PID {ProcessId}");
+            if (!string.IsNullOrWhiteSpace(ComClassName)) parts.Add(ComClassName);
+            if (!string.IsNullOrWhiteSpace(Reason)) parts.Add(Reason);
+            return string.Join(" | ", parts);
+        }
+    }
 
     public void Dispose()
     {
         if (_disposed) return;
         _disposed = true;
         Icon?.Dispose();
+        foreach (var candidate in ProcessCandidates)
+            candidate.Dispose();
+    }
+}
+
+public sealed class ProcessCandidate : IDisposable
+{
+    public required uint ProcessId { get; init; }
+    public required string ProcessName { get; init; }
+    public required string? CommandLine { get; init; }
+    public required Icon? Icon { get; init; }
+
+    public string Label => $"{ProcessName} PID {ProcessId}";
+    public string CommandSummary => CommandLineFormatter.Summarize(CommandLine);
+    public string? DecodedCommandSummary => CommandLineFormatter.DecodeEncodedPowerShell(CommandLine);
+
+    public void Dispose()
+    {
+        Icon?.Dispose();
+    }
+}
+
+static class CommandLineFormatter
+{
+    public static string Summarize(string? commandLine)
+    {
+        if (string.IsNullOrWhiteSpace(commandLine)) return "";
+
+        string summary = commandLine;
+        var encoded = System.Text.RegularExpressions.Regex.Match(
+            commandLine,
+            @"(?i)(?:-|/)e(?:ncodedcommand)?\s+(?<payload>[A-Za-z0-9+/=]+)");
+        if (encoded.Success)
+        {
+            summary = commandLine[..encoded.Index].Trim() + " -EncodedCommand <base64>";
+        }
+
+        return TruncateMiddle(summary, 96);
+    }
+
+    public static string? DecodeEncodedPowerShell(string? commandLine)
+    {
+        if (string.IsNullOrWhiteSpace(commandLine)) return null;
+
+        var match = System.Text.RegularExpressions.Regex.Match(
+            commandLine,
+            @"(?i)(?:-|/)e(?:ncodedcommand)?\s+(?<payload>[A-Za-z0-9+/=]+)");
+        if (!match.Success) return null;
+
+        try
+        {
+            string decoded = Encoding.Unicode.GetString(Convert.FromBase64String(match.Groups["payload"].Value));
+            return TruncateMiddle(decoded.Replace("\r", " ").Replace("\n", " "), 140);
+        }
+        catch
+        {
+            return "Could not decode -EncodedCommand";
+        }
+    }
+
+    private static string TruncateMiddle(string value, int maxLength)
+    {
+        if (value.Length <= maxLength) return value;
+
+        int left = (maxLength - 3) / 2;
+        int right = maxLength - 3 - left;
+        return value[..left] + "..." + value[^right..];
     }
 }
 
 sealed class PowerRequestMonitor
 {
-    // バッファ構造 (Windows 11 x64 で実測確認済み):
-    //   Header:  [+0x00] uint64 Count
-    //            [+0x08] uint64[Count] Offsets  (バッファ先頭からの各要素オフセット)
-    //   Element: [+0x00] uint64 TypeMarker
-    //            [+0x08] uint64 f1
-    //            [+0x10] uint64 f2   ← DISPLAY アクティブ要求数 (0x3F 型)
-    //            [+0x18] uint64 f3
-    //            [+0x20] uint64 f4
-    //            [+0x28] uint64 f5
-    //            [+0x30] uint64 f6
-    //            [+0x38] uint64 f7   ← PID (経験的に確認・未公式)
-    //            [+0x40] uint64 f8
-    //            [+0x48] WCHAR[] name    (null 終端 UTF-16LE)
-    //                    WCHAR[] reason  (name の直後、null 終端)
-
-    private const ulong TypeMarkerProcess = 0x3F; // ユーザーモードプロセス (DISPLAY/SYSTEM/AwayMode)
-    private const int   OffF2             = 0x10; // DISPLAY アクティブフラグ
-    private const int   OffF7             = 0x38; // PID
-    private const int   OffStrings        = 0x48; // 文字列開始位置
+    private const ulong TypeMarkerKernel = 0x12;
+    private const ulong TypeMarkerLegacy = 0x1E;
+    private const ulong TypeMarkerProcess = 0x3F;
+    private const ulong TypeMarkerExecutionProcess = 0x1000003F;
+    private const int OffProcessId = 0x38;
+    private const int OffStrings = 0x48;
+    private const int OffAltStrings = 0x68;
 
     private readonly Icon _fallbackIcon;
 
     public PowerRequestMonitor(Icon fallbackIcon) => _fallbackIcon = fallbackIcon;
 
-    // ── 公開 API ─────────────────────────────────────────────────────────────
-
-    public List<DisplayBlockerEntry> GetDisplayBlockers()
+    public List<PowerRequestEntry> GetBlockers()
     {
-        try { return QueryDisplayBlockers(); }
-        catch { return []; }
+        try
+        {
+            var nativeEntries = QueryNativeEntries();
+            var entries = QueryPowercfgEntries();
+
+            foreach (var entry in entries)
+            {
+                EnrichFromNative(entry, nativeEntries);
+                EnrichFromProcess(entry);
+            }
+
+            return entries
+                .OrderByDescending(static x => x.BlocksSleep)
+                .ThenBy(static x => x.DisplayName, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+        }
+        catch
+        {
+            return [];
+        }
     }
 
-    // ── API 呼び出し ─────────────────────────────────────────────────────────
+    private List<PowerRequestEntry> QueryPowercfgEntries()
+    {
+        using var proc = new Process();
+        proc.StartInfo = new ProcessStartInfo
+        {
+            FileName = "powercfg.exe",
+            ArgumentList = { "/requests" },
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+        };
 
-    private List<DisplayBlockerEntry> QueryDisplayBlockers()
+        proc.Start();
+        string output = proc.StandardOutput.ReadToEnd();
+        proc.WaitForExit(5000);
+
+        var entries = new Dictionary<string, PowerRequestEntry>(StringComparer.OrdinalIgnoreCase);
+        string category = "";
+        string sourceType = "";
+        string nativePath = "";
+
+        foreach (string rawLine in output.Replace("\r", "").Split('\n'))
+        {
+            string line = rawLine.Trim();
+            if (line.Length == 0 || line == "None.") continue;
+
+            if (line.EndsWith(':'))
+            {
+                AddPowercfgEntry(entries, category, sourceType, nativePath, "");
+                category = line.TrimEnd(':');
+                sourceType = "";
+                nativePath = "";
+                continue;
+            }
+
+            if (line.StartsWith('['))
+            {
+                AddPowercfgEntry(entries, category, sourceType, nativePath, "");
+                int close = line.IndexOf(']');
+                if (close <= 1) continue;
+
+                sourceType = line[1..close];
+                nativePath = line[(close + 1)..].Trim();
+                continue;
+            }
+
+            if (category.Length == 0 || sourceType.Length == 0 || nativePath.Length == 0)
+                continue;
+
+            AddPowercfgEntry(entries, category, sourceType, nativePath, line);
+            sourceType = "";
+            nativePath = "";
+        }
+
+        AddPowercfgEntry(entries, category, sourceType, nativePath, "");
+
+        return entries.Values.ToList();
+    }
+
+    private void AddPowercfgEntry(
+        Dictionary<string, PowerRequestEntry> entries,
+        string category,
+        string sourceType,
+        string nativePath,
+        string reason)
+    {
+        if (category.Length == 0 || sourceType.Length == 0 || nativePath.Length == 0)
+            return;
+
+        string key = $"{sourceType}|{nativePath}|{reason}";
+        if (!entries.TryGetValue(key, out var entry))
+        {
+            string? win32Path = NtPathConverter.ToWin32Path(nativePath);
+            string displayName = GetDisplayName(sourceType, nativePath, win32Path);
+
+            entry = new PowerRequestEntry
+            {
+                SourceType = sourceType,
+                NativePath = nativePath,
+                DisplayName = displayName,
+                Reason = reason,
+                Categories = [],
+                Icon = TryExtractIcon(win32Path) ?? new Icon(_fallbackIcon, 16, 16),
+            };
+            entries.Add(key, entry);
+        }
+
+        if (!entry.Categories.Contains(category))
+            entry.Categories.Add(category);
+    }
+
+    private static string GetDisplayName(string sourceType, string nativePath, string? win32Path)
+    {
+        if (sourceType == "PROCESS")
+        {
+            string fileName = Path.GetFileName(win32Path ?? nativePath);
+            return string.IsNullOrWhiteSpace(fileName) ? nativePath : fileName;
+        }
+
+        return nativePath;
+    }
+
+    private List<NativeRequestEntry> QueryNativeEntries()
     {
         uint size = 16384;
         while (true)
@@ -68,10 +265,14 @@ sealed class PowerRequestMonitor
                     NativePower.PowerRequestListLevel,
                     IntPtr.Zero, 0, buf, size);
 
-                if (status == NativePower.StatusBufferTooSmall) { size *= 2; continue; }
+                if (status == NativePower.StatusBufferTooSmall)
+                {
+                    size *= 2;
+                    continue;
+                }
                 if (status != NativePower.StatusSuccess) return [];
 
-                return ParseDisplayEntries(buf, size);
+                return ParseNativeEntries(buf, size);
             }
             finally
             {
@@ -80,12 +281,10 @@ sealed class PowerRequestMonitor
         }
     }
 
-    // ── バッファ解析 ─────────────────────────────────────────────────────────
-
-    private List<DisplayBlockerEntry> ParseDisplayEntries(IntPtr buf, uint bufSize)
+    private static List<NativeRequestEntry> ParseNativeEntries(IntPtr buf, uint bufSize)
     {
         ulong count = (ulong)Marshal.ReadInt64(buf, 0);
-        var result  = new List<DisplayBlockerEntry>();
+        var result = new List<NativeRequestEntry>();
 
         for (ulong i = 0; i < count; i++)
         {
@@ -96,93 +295,70 @@ sealed class PowerRequestMonitor
             if (elemOff + OffStrings + 2 > bufSize) continue;
 
             IntPtr elem = IntPtr.Add(buf, (int)elemOff);
-
             ulong typeMarker = (ulong)Marshal.ReadInt64(elem, 0x00);
-            if (typeMarker != TypeMarkerProcess) continue;
+            int stringOffset = typeMarker == TypeMarkerKernel ? OffAltStrings : OffStrings;
+            if (elemOff + (ulong)stringOffset + 2 > bufSize) continue;
 
-            ulong f2 = (ulong)Marshal.ReadInt64(elem, OffF2);
-            if (f2 == 0) continue; // DISPLAY 要求がアクティブでない
+            int maxBytes = (int)(bufSize - elemOff) - stringOffset;
+            var (nativePath, reason) = ReadStringPair(elem, stringOffset, maxBytes);
+            if (string.IsNullOrWhiteSpace(nativePath)) continue;
 
-            ulong f7 = (ulong)Marshal.ReadInt64(elem, OffF7);
-
-            int maxBytes    = (int)(bufSize - elemOff) - OffStrings;
-            var (ntPath, _) = ReadStringPair(elem, OffStrings, maxBytes);
-
-            string? win32Path = NtPathConverter.ToWin32Path(ntPath);
-            string  fileName  = Path.GetFileName(win32Path ?? ntPath);
-            if (string.IsNullOrEmpty(fileName)) fileName = ntPath;
-
-            uint  pid  = ResolvePid(f7, win32Path);
-            Icon? icon = TryExtractIcon(win32Path) ?? new Icon(_fallbackIcon, 16, 16);
-
-            result.Add(new DisplayBlockerEntry
+            result.Add(new NativeRequestEntry
             {
-                ProcessId = pid,
-                FileName  = fileName,
-                Icon      = icon,
+                TypeMarker = typeMarker,
+                ProcessId = ReadProcessId(typeMarker, elem),
+                NativePath = nativePath,
+                Reason = reason,
+                Categories = ReadNativeCategories(typeMarker, elem),
             });
         }
 
         return result;
     }
 
-    // ── PID 解決 ─────────────────────────────────────────────────────────────
-
-    // f7 に PID が格納されていることを経験的に確認済み (未公式)。
-    // プロセスが実在しパスが一致すれば採用し、そうでなければ名前マッチングにフォールバックする。
-    private static uint ResolvePid(ulong f7Candidate, string? win32Path)
+    private static uint ReadProcessId(ulong typeMarker, IntPtr elem)
     {
-        if (f7Candidate > 0 && f7Candidate <= uint.MaxValue)
-        {
-            uint candidate = (uint)f7Candidate;
-            try
-            {
-                using var proc = Process.GetProcessById((int)candidate);
-                if (win32Path is null ||
-                    string.Equals(proc.MainModule?.FileName, win32Path,
-                        StringComparison.OrdinalIgnoreCase))
-                    return candidate;
-            }
-            catch { }
-        }
+        if (typeMarker is not TypeMarkerProcess and not TypeMarkerExecutionProcess)
+            return 0;
 
-        return win32Path is not null ? FindPidByPath(win32Path) : 0;
+        ulong value = (ulong)Marshal.ReadInt64(elem, OffProcessId);
+        return value > 0 && value <= uint.MaxValue ? (uint)value : 0;
     }
 
-    private static uint FindPidByPath(string win32Path)
+    private static List<string> ReadNativeCategories(ulong typeMarker, IntPtr elem)
     {
-        try
-        {
-            string name = Path.GetFileNameWithoutExtension(win32Path);
-            foreach (var proc in Process.GetProcessesByName(name))
-            {
-                try
-                {
-                    if (string.Equals(proc.MainModule?.FileName, win32Path,
-                            StringComparison.OrdinalIgnoreCase))
-                        return (uint)proc.Id;
-                }
-                catch { }
-                finally { proc.Dispose(); }
-            }
-        }
-        catch { }
-        return 0;
-    }
+        ulong f1 = (ulong)Marshal.ReadInt64(elem, 0x08);
+        ulong f2 = (ulong)Marshal.ReadInt64(elem, 0x10);
+        ulong f5 = (ulong)Marshal.ReadInt64(elem, 0x28);
+        var categories = new List<string>();
 
-    // ── 文字列読み取り ───────────────────────────────────────────────────────
+        if (typeMarker == TypeMarkerProcess)
+        {
+            if (f2 != 0) categories.Add("DISPLAY");
+            if (f1 != 0) categories.Add("SYSTEM");
+        }
+        else if (typeMarker == TypeMarkerExecutionProcess)
+        {
+            if (f5 != 0) categories.Add("EXECUTION");
+        }
+        else if (typeMarker == TypeMarkerKernel || typeMarker == TypeMarkerLegacy)
+        {
+            if (f1 != 0 || f5 != 0) categories.Add("SYSTEM");
+        }
+
+        return categories;
+    }
 
     private static (string first, string second) ReadStringPair(
         IntPtr elem, int startOffset, int maxBytes)
     {
-        int limit  = startOffset + maxBytes;
+        int limit = startOffset + maxBytes;
         int offset = startOffset;
-        string first  = ReadNullTermWChar(elem, ref offset, limit);
+        string first = ReadNullTermWChar(elem, ref offset, limit);
         string second = ReadNullTermWChar(elem, ref offset, limit);
         return (first, second);
     }
 
-    // byteOffset を更新しながら null 終端 WCHAR 文字列を読む
     private static string ReadNullTermWChar(IntPtr elem, ref int byteOffset, int limit)
     {
         var sb = new StringBuilder();
@@ -196,7 +372,117 @@ sealed class PowerRequestMonitor
         return sb.ToString();
     }
 
-    // ── アイコン取得 ─────────────────────────────────────────────────────────
+    private static void EnrichFromNative(PowerRequestEntry entry, List<NativeRequestEntry> nativeEntries)
+    {
+        var candidates = nativeEntries
+            .Where(x => string.Equals(x.NativePath, entry.NativePath, StringComparison.OrdinalIgnoreCase))
+            .Where(x => string.IsNullOrWhiteSpace(entry.Reason) ||
+                string.Equals(x.Reason, entry.Reason, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+
+        var exact = candidates.FirstOrDefault(x => entry.Categories.Any(x.Categories.Contains));
+        var match = exact ?? candidates.FirstOrDefault();
+        if (match is null || match.ProcessId == 0) return;
+
+        entry.ProcessId = match.ProcessId;
+    }
+
+    private static void EnrichFromProcess(PowerRequestEntry entry)
+    {
+        if (entry.SourceType != "PROCESS") return;
+
+        if (entry.ProcessId == 0)
+        {
+            var candidates = FindProcessesByPath(NtPathConverter.ToWin32Path(entry.NativePath));
+            if (candidates.Count == 1)
+                entry.ProcessId = candidates[0].ProcessId;
+            else
+                entry.ProcessCandidates.AddRange(candidates);
+        }
+
+        if (entry.ProcessId == 0) return;
+
+        entry.CommandLine = TryGetCommandLine(entry.ProcessId);
+        entry.ComClassName = TryGetComClassName(entry.CommandLine);
+    }
+
+    private static List<ProcessCandidate> FindProcessesByPath(string? win32Path)
+    {
+        if (string.IsNullOrWhiteSpace(win32Path)) return [];
+
+        try
+        {
+            string name = Path.GetFileNameWithoutExtension(win32Path);
+            var matches = new List<ProcessCandidate>();
+
+            foreach (var proc in Process.GetProcessesByName(name))
+            {
+                try
+                {
+                    string? modulePath = proc.MainModule?.FileName;
+                    if (string.IsNullOrWhiteSpace(modulePath)) continue;
+
+                    if (string.Equals(modulePath, win32Path, StringComparison.OrdinalIgnoreCase))
+                    {
+                        matches.Add(new ProcessCandidate
+                        {
+                            ProcessId = (uint)proc.Id,
+                            ProcessName = Path.GetFileName(modulePath),
+                            CommandLine = TryGetCommandLine((uint)proc.Id),
+                            Icon = TryExtractIcon(modulePath),
+                        });
+                    }
+                }
+                catch { }
+                finally { proc.Dispose(); }
+            }
+
+            return matches;
+        }
+        catch
+        {
+            return [];
+        }
+    }
+
+    private static string? TryGetCommandLine(uint processId)
+    {
+        try
+        {
+            using var searcher = new ManagementObjectSearcher(
+                $"SELECT CommandLine FROM Win32_Process WHERE ProcessId = {processId}");
+            using ManagementObjectCollection results = searcher.Get();
+            return results.Cast<ManagementObject>()
+                .Select(static x => x["CommandLine"]?.ToString())
+                .FirstOrDefault(static x => !string.IsNullOrWhiteSpace(x));
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static string? TryGetComClassName(string? commandLine)
+    {
+        if (string.IsNullOrWhiteSpace(commandLine)) return null;
+
+        var match = System.Text.RegularExpressions.Regex.Match(
+            commandLine,
+            @"/Processid:\{(?<id>[0-9a-fA-F\-]+)\}",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        if (!match.Success) return null;
+
+        string clsid = "{" + match.Groups["id"].Value + "}";
+        try
+        {
+            using var key = Microsoft.Win32.Registry.ClassesRoot.OpenSubKey($@"CLSID\{clsid}");
+            return key?.GetValue(null)?.ToString();
+        }
+        catch
+        {
+            return null;
+        }
+    }
 
     private static Icon? TryExtractIcon(string? win32Path)
     {
@@ -206,6 +492,18 @@ sealed class PowerRequestMonitor
             using var full = Icon.ExtractAssociatedIcon(win32Path);
             return full is null ? null : new Icon(full, 16, 16);
         }
-        catch { return null; }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private sealed class NativeRequestEntry
+    {
+        public required ulong TypeMarker { get; init; }
+        public required uint ProcessId { get; init; }
+        public required string NativePath { get; init; }
+        public required string Reason { get; init; }
+        public required List<string> Categories { get; init; }
     }
 }

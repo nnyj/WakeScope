@@ -26,11 +26,8 @@ static class Program
         NativePower.EnablePrivilege("SeShutdownPrivilege");
         NativePower.EnablePrivilege("SeDebugPrivilege");
 
+        Application.SetHighDpiMode(HighDpiMode.PerMonitorV2);
         ApplicationConfiguration.Initialize();
-
-        // WindowsFormsSynchronizationContext を明示的に設定する。
-        // TrayApp のコンストラクタは Application.Run() より先に実行されるため、
-        // ここで設定しないと SynchronizationContext.Current が null になる。
         SynchronizationContext.SetSynchronizationContext(new WindowsFormsSynchronizationContext());
 
         using var app = new TrayApp();

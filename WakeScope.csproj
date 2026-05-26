@@ -5,10 +5,15 @@
     <TargetFramework>net8.0-windows</TargetFramework>
     <AssemblyName>WakeScope</AssemblyName>
     <RootNamespace>WakeScope</RootNamespace>
+    <Version>1.0.0</Version>
+    <AssemblyVersion>1.0.0.0</AssemblyVersion>
+    <FileVersion>1.0.0.0</FileVersion>
+    <InformationalVersion>1.0.0</InformationalVersion>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <PlatformTarget>x64</PlatformTarget>
+    <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
     <UseWindowsForms>true</UseWindowsForms>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <Optimize>true</Optimize>
@@ -16,12 +21,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <EmbeddedResource Include="icons\tray_idle.ico">
-      <LogicalName>WakeScope.icons.tray_idle.ico</LogicalName>
-    </EmbeddedResource>
-    <EmbeddedResource Include="icons\tray_active.ico">
-      <LogicalName>WakeScope.icons.tray_active.ico</LogicalName>
-    </EmbeddedResource>
+    <PackageReference Include="System.Management" Version="8.0.0" />
   </ItemGroup>
 
 </Project>
