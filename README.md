@@ -1,87 +1,89 @@
-# WakeScope
+﻿# WakeScope
 
-「なぜスリープしない？」の犯人を1秒ごとに監視する、タスクトレイ常駐ツールです。  
-DISPLAY 電力要求をブロックしているプロセスをリアルタイムで検出・表示します。
+Tray tool for finding Windows power requests that block display sleep or system sleep.
 
-[English README](README-en.md)
+## Features
 
-## 概要
+- Polls every `2s`
+- Runs as administrator, required for power request APIs
+- Shows tray state:
+  - gray, no blockers
+  - orange, display-only blocker
+  - red, any sleep blocker
+- Left-click or right-click opens blocker menu
+- Groups blockers by `Display` and `Sleep`
+- Shows process name, PID, reason, COM class name where available
+- Shows matching processes when Windows reports path but not PID
+- Shows compact command line and decodes PowerShell `-EncodedCommand`
+- Can kill process blockers from menu
+- Shows driver/kernel blockers, but cannot kill them because Windows exposes no PID
+- Single instance via global mutex
 
-Windows はディスプレイのスリープ前に DISPLAY 電力要求の有無を確認します。  
-動画再生中のブラウザや一部のアプリはこの要求を発行し続けるため、画面がスリープ状態になりません。  
-WakeScope はその犯人を Windows の電力要求 API を直接呼び出して1秒ごとに監視し、トレイアイコンの色で即座に知らせます。
+## Install
 
-## 機能
+1. Run `publish\WakeScope.exe`
+2. Accept UAC prompt
+3. Keep app in tray
 
-- タスクトレイに常駐し、UI を占有しない
-- DISPLAY 電力要求を1秒ごとに自動監視
-- ブロッカー検出時はトレイアイコンを明るく表示(検出していない場合アイコンを暗く表示)
-- 右クリックメニューでプロセス名・PID・アイコンを一覧表示
-- 多重起動防止（グローバル Mutex）
+## Build
 
-## 動作環境
-
-| 項目 | 要件 |
-|------|------|
-| OS | Windows 11（x64） |
-| ランタイム | 不要（自己完結型） |
-| 権限 | **管理者権限が必要**（電力要求 API の呼び出しに必須） |
-
-## インストール
-
-1. [Releases](https://github.com/130cmWolf/WakeScope/releases) から最新の zip をダウンロードして展開する、または自分でビルドする
-2. `WakeScope.exe` を右クリック →「管理者として実行」
-
-### 自分でビルドする場合
-
-.NET 8 SDK が必要です。
-
-```bash
-git clone https://github.com/130cmWolf/WakeScope.git
-cd WakeScope
+```powershell
 dotnet publish -p:PublishProfile=Release
 ```
 
-`publish\WakeScope.exe` が生成されます。
+Output:
 
-## 使い方
-
-1. 管理者として `WakeScope.exe` を実行するとタスクトレイにアイコンが表示される
-2. ブロッカーがなければ暗いアイコン、1件以上あれば明るいアイコンに変化する
-3. 右クリックでブロッカーの一覧と「Exit」メニューを表示する
-
-## 仕組み
-
-`powrprof.dll` の [`PowerInformationWithPrivileges`](docs/PowerInformationWithPrivileges.md)（レベル 45）を1秒ごとに呼び出し、システム全体の電力要求リストをバッファとして取得します。  
-TypeMarker `0x3F` かつアクティブフラグが 0 でないエントリを DISPLAY ブロッカーとして抽出し、NT パスを Win32 パスに変換してプロセスアイコンと PID を特定します。
-
-```mermaid
-flowchart TD
-    A([起動]) --> B[トレイアイコン・フォールバックアイコンを読み込む]
-    B --> C[タスクトレイアイコンを表示]
-    C --> D[1秒待機]
-    D --> E[PowerInformationWithPrivileges を呼び出す]
-    E --> F[TypeMarker 0x3F のアクティブエントリを抽出]
-    F --> G{DISPLAY ブロッカーあり?}
-    G -- No --> H[アイコン: 明]
-    G -- Yes --> I[アイコン: 暗]
-    H --> D
-    I --> D
-    C --> J{{右クリック → 終了}}
-    J --> K([終了])
+```text
+publish\WakeScope.exe
 ```
 
-## 動作確認
+Current publish profile creates one self-contained `win-x64` exe.
 
-YouTube を Chrome で再生中に以下を実行し、WakeScope の表示と一致すれば正常です。
+## Usage
 
-```
+- Tray icon changes when blockers appear
+- Open tray menu with left-click or right-click
+- Use `Refresh` to force immediate check
+- Use `Kill process` only when listed blocker is safe to terminate
+- Use `Exit` to close WakeScope
+
+## What It Detects
+
+- `DISPLAY` requests, usually media playback or browser video
+- `SYSTEM` requests, blocks automatic system sleep
+- `EXECUTION` requests, usually process lifetime requests
+- driver requests such as audio streams
+- kernel requests such as `Legacy Kernel Caller`
+
+## Limitations
+
+- Driver and kernel requests do not expose a process PID
+- `Legacy Kernel Caller` cannot be killed from WakeScope
+- If multiple processes share same executable path, WakeScope lists matching PIDs instead of guessing
+- Native parser uses undocumented Windows structure offsets, verified against `powercfg /requests`
+
+## Verification
+
+Run:
+
+```powershell
 powercfg /requests
-DISPLAY:
-[PROCESS] \Device\HarddiskVolume3\...\chrome.exe
-Video Wake Lock
 ```
 
-## ライセンス
+WakeScope should show same active categories and blockers.
 
-MIT — [130cmWolf](https://github.com/130cmWolf/WakeScope)
+Test script:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File C:\N\scripts\system\sleep_block_test.ps1 -Mode both
+```
+
+## Notes
+
+- Based on upstream `130cmWolf/WakeScope`
+- Upstream monitored display blockers only
+- This fork also parses `powercfg /requests` categories and adds sleep blockers, process kill actions, and compact command-line display
+
+## License
+
+MIT, original project by [130cmWolf/WakeScope](https://github.com/130cmWolf/WakeScope)
