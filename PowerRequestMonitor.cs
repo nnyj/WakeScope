@@ -131,15 +131,49 @@ sealed class PowerRequestMonitor
         try
         {
             var nativeEntries = QueryNativeEntries();
-            var entries = QueryPowercfgEntries();
+            var merged = new Dictionary<string, PowerRequestEntry>(StringComparer.OrdinalIgnoreCase);
 
-            foreach (var entry in entries)
+            foreach (var native in nativeEntries)
             {
-                EnrichFromNative(entry, nativeEntries);
-                EnrichFromProcess(entry);
+                if (native.Categories.Count == 0) continue;
+
+                string sourceType = native.TypeMarker is TypeMarkerProcess or TypeMarkerExecutionProcess
+                    ? "PROCESS" : "DRIVER";
+
+                string key = $"{sourceType}|{native.NativePath}|{native.Reason}";
+
+                if (!merged.TryGetValue(key, out var entry))
+                {
+                    string? win32Path = NtPathConverter.ToWin32Path(native.NativePath);
+                    string displayName = GetDisplayName(sourceType, native.NativePath, win32Path);
+
+                    entry = new PowerRequestEntry
+                    {
+                        SourceType = sourceType,
+                        NativePath = native.NativePath,
+                        DisplayName = displayName,
+                        Reason = native.Reason,
+                        Categories = [],
+                        ProcessId = native.ProcessId,
+                        Icon = TryExtractIcon(win32Path) ?? new Icon(_fallbackIcon, 16, 16),
+                    };
+                    merged.Add(key, entry);
+                }
+
+                foreach (var cat in native.Categories)
+                {
+                    if (!entry.Categories.Contains(cat))
+                        entry.Categories.Add(cat);
+                }
+
+                if (entry.ProcessId == 0 && native.ProcessId != 0)
+                    entry.ProcessId = native.ProcessId;
             }
 
-            return entries
+            foreach (var entry in merged.Values)
+                EnrichFromProcess(entry);
+
+            return merged.Values
                 .OrderByDescending(static x => x.BlocksSleep)
                 .ThenBy(static x => x.DisplayName, StringComparer.OrdinalIgnoreCase)
                 .ToList();
@@ -148,98 +182,6 @@ sealed class PowerRequestMonitor
         {
             return [];
         }
-    }
-
-    private List<PowerRequestEntry> QueryPowercfgEntries()
-    {
-        using var proc = new Process();
-        proc.StartInfo = new ProcessStartInfo
-        {
-            FileName = "powercfg.exe",
-            ArgumentList = { "/requests" },
-            UseShellExecute = false,
-            CreateNoWindow = true,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-        };
-
-        proc.Start();
-        string output = proc.StandardOutput.ReadToEnd();
-        proc.WaitForExit(5000);
-
-        var entries = new Dictionary<string, PowerRequestEntry>(StringComparer.OrdinalIgnoreCase);
-        string category = "";
-        string sourceType = "";
-        string nativePath = "";
-
-        foreach (string rawLine in output.Replace("\r", "").Split('\n'))
-        {
-            string line = rawLine.Trim();
-            if (line.Length == 0 || line == "None.") continue;
-
-            if (line.EndsWith(':'))
-            {
-                AddPowercfgEntry(entries, category, sourceType, nativePath, "");
-                category = line.TrimEnd(':');
-                sourceType = "";
-                nativePath = "";
-                continue;
-            }
-
-            if (line.StartsWith('['))
-            {
-                AddPowercfgEntry(entries, category, sourceType, nativePath, "");
-                int close = line.IndexOf(']');
-                if (close <= 1) continue;
-
-                sourceType = line[1..close];
-                nativePath = line[(close + 1)..].Trim();
-                continue;
-            }
-
-            if (category.Length == 0 || sourceType.Length == 0 || nativePath.Length == 0)
-                continue;
-
-            AddPowercfgEntry(entries, category, sourceType, nativePath, line);
-            sourceType = "";
-            nativePath = "";
-        }
-
-        AddPowercfgEntry(entries, category, sourceType, nativePath, "");
-
-        return entries.Values.ToList();
-    }
-
-    private void AddPowercfgEntry(
-        Dictionary<string, PowerRequestEntry> entries,
-        string category,
-        string sourceType,
-        string nativePath,
-        string reason)
-    {
-        if (category.Length == 0 || sourceType.Length == 0 || nativePath.Length == 0)
-            return;
-
-        string key = $"{sourceType}|{nativePath}|{reason}";
-        if (!entries.TryGetValue(key, out var entry))
-        {
-            string? win32Path = NtPathConverter.ToWin32Path(nativePath);
-            string displayName = GetDisplayName(sourceType, nativePath, win32Path);
-
-            entry = new PowerRequestEntry
-            {
-                SourceType = sourceType,
-                NativePath = nativePath,
-                DisplayName = displayName,
-                Reason = reason,
-                Categories = [],
-                Icon = TryExtractIcon(win32Path) ?? new Icon(_fallbackIcon, 16, 16),
-            };
-            entries.Add(key, entry);
-        }
-
-        if (!entry.Categories.Contains(category))
-            entry.Categories.Add(category);
     }
 
     private static string GetDisplayName(string sourceType, string nativePath, string? win32Path)
@@ -301,7 +243,7 @@ sealed class PowerRequestMonitor
 
             int maxBytes = (int)(bufSize - elemOff) - stringOffset;
             var (nativePath, reason) = ReadStringPair(elem, stringOffset, maxBytes);
-            if (string.IsNullOrWhiteSpace(nativePath)) continue;
+            if (string.IsNullOrWhiteSpace(nativePath) || !nativePath.Contains('\\')) continue;
 
             result.Add(new NativeRequestEntry
             {
@@ -318,11 +260,8 @@ sealed class PowerRequestMonitor
 
     private static uint ReadProcessId(ulong typeMarker, IntPtr elem)
     {
-        if (typeMarker is not TypeMarkerProcess and not TypeMarkerExecutionProcess)
-            return 0;
-
-        ulong value = (ulong)Marshal.ReadInt64(elem, OffProcessId);
-        return value > 0 && value <= uint.MaxValue ? (uint)value : 0;
+        int value = Marshal.ReadInt32(elem, OffProcessId);
+        return value > 0 ? (uint)value : 0;
     }
 
     private static List<string> ReadNativeCategories(ulong typeMarker, IntPtr elem)
@@ -341,10 +280,7 @@ sealed class PowerRequestMonitor
         {
             if (f5 != 0) categories.Add("EXECUTION");
         }
-        else if (typeMarker == TypeMarkerKernel || typeMarker == TypeMarkerLegacy)
-        {
-            if (f1 != 0 || f5 != 0) categories.Add("SYSTEM");
-        }
+        // kernel/legacy entries are registrations, not active blockers — skip
 
         return categories;
     }
@@ -372,21 +308,6 @@ sealed class PowerRequestMonitor
         return sb.ToString();
     }
 
-    private static void EnrichFromNative(PowerRequestEntry entry, List<NativeRequestEntry> nativeEntries)
-    {
-        var candidates = nativeEntries
-            .Where(x => string.Equals(x.NativePath, entry.NativePath, StringComparison.OrdinalIgnoreCase))
-            .Where(x => string.IsNullOrWhiteSpace(entry.Reason) ||
-                string.Equals(x.Reason, entry.Reason, StringComparison.OrdinalIgnoreCase))
-            .ToList();
-
-        var exact = candidates.FirstOrDefault(x => entry.Categories.Any(x.Categories.Contains));
-        var match = exact ?? candidates.FirstOrDefault();
-        if (match is null || match.ProcessId == 0) return;
-
-        entry.ProcessId = match.ProcessId;
-    }
-
     private static void EnrichFromProcess(PowerRequestEntry entry)
     {
         if (entry.SourceType != "PROCESS") return;
@@ -404,6 +325,7 @@ sealed class PowerRequestMonitor
 
         entry.CommandLine = TryGetCommandLine(entry.ProcessId);
         entry.ComClassName = TryGetComClassName(entry.CommandLine);
+
     }
 
     private static List<ProcessCandidate> FindProcessesByPath(string? win32Path)
