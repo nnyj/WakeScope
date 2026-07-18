@@ -1,29 +1,37 @@
-﻿# WakeScope
+# WakeScope
 
-Tray tool for finding Windows power requests that block display sleep or system sleep.
+<div align="center">
+
+[![Stars](https://img.shields.io/github/stars/nnyj/WakeScope?style=for-the-badge&labelColor=555&color=e3b341)](https://github.com/nnyj/WakeScope/stargazers)
+[![Downloads](https://img.shields.io/github/downloads/nnyj/WakeScope/total?style=for-the-badge&labelColor=555&color=2ea44f)](https://github.com/nnyj/WakeScope/releases)
+[![Latest Release](https://img.shields.io/github/v/release/nnyj/WakeScope?style=for-the-badge&label=Latest%20Release&labelColor=555&color=3572d6)](https://github.com/nnyj/WakeScope/releases/latest)
+
+</div>
+
+Windows system tray tool that identifies active power requests blocking display sleep or system sleep, with process details and a kill action.
 
 ## Features
 
-- Polls every `2s`
-- Runs as administrator, required for power request APIs
-- Shows tray state:
-  - gray, no blockers
-  - orange, display-only blocker
-  - red, any sleep blocker
-- Left-click or right-click opens blocker menu
-- Groups blockers by `Display` and `Sleep`
-- Shows process name, PID, reason, COM class name where available
-- Shows matching processes when Windows reports path but not PID
-- Shows compact command line and decodes PowerShell `-EncodedCommand`
-- Can kill process blockers from menu
-- Shows driver/kernel blockers, but cannot kill them because Windows exposes no PID
-- Single instance via global mutex
+- Polls every 2 s via native `PowerInformationWithPrivileges` API, no process spawn per tick
+- Color-coded tray icon: gray (no blockers), orange (display-only blocker), red (any sleep blocker)
+- Groups blockers by `Display` and `Sleep` category
+- Shows process name, PID, reason string, COM class name where available
+- Decodes PowerShell `-EncodedCommand` for readable command-line display
+- Lists all matching processes when Windows reports a path without a PID
+- Kill option for process-backed blockers from the tray menu
+- Reports driver and kernel blockers (cannot kill, Windows exposes no PID)
+- Single instance enforced via global mutex
+- Requires administrator, UAC prompt on launch
 
-## Install
+## Usage
 
-1. Run `publish\WakeScope.exe`
-2. Accept UAC prompt
-3. Keep app in tray
+Run `publish\WakeScope.exe` and accept the UAC prompt.
+
+- Tray icon reflects current blocker state
+- Left-click or right-click opens the blocker menu
+- `Refresh` forces an immediate check
+- `Kill process` terminates the selected process blocker
+- `Exit` stops WakeScope
 
 ## Build
 
@@ -31,59 +39,43 @@ Tray tool for finding Windows power requests that block display sleep or system 
 dotnet publish -p:PublishProfile=Release
 ```
 
-Output:
-
-```text
-publish\WakeScope.exe
-```
-
-Current publish profile creates one self-contained `win-x64` exe.
-
-## Usage
-
-- Tray icon changes when blockers appear
-- Open tray menu with left-click or right-click
-- Use `Refresh` to force immediate check
-- Use `Kill process` only when listed blocker is safe to terminate
-- Use `Exit` to close WakeScope
-
-## What It Detects
-
-- `DISPLAY` requests, usually media playback or browser video
-- `SYSTEM` requests, blocks automatic system sleep
-- `EXECUTION` requests, usually process lifetime requests
-- driver requests such as audio streams
-- kernel requests such as `Legacy Kernel Caller`
-
-## Limitations
-
-- Driver and kernel requests do not expose a process PID
-- `Legacy Kernel Caller` cannot be killed from WakeScope
-- If multiple processes share same executable path, WakeScope lists matching PIDs instead of guessing
-- Native parser uses undocumented Windows structure offsets, verified against `powercfg /requests`
+Output: `publish\WakeScope.exe`, self-contained single-file `win-x64` binary.
 
 ## Verification
 
-Run:
+Compare against the Windows built-in tool:
 
 ```powershell
 powercfg /requests
 ```
 
-WakeScope should show same active categories and blockers.
-
-Test script:
+Test blocking behavior with the included helper:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\tests\sleep_block_test.ps1
 ```
 
-## Notes
+## How it works
 
-- Based on upstream `130cmWolf/WakeScope`
-- Upstream monitored display blockers only
-- This fork also parses `powercfg /requests` categories and adds sleep blockers, process kill actions, and compact command-line display
+WakeScope calls `PowerInformationWithPrivileges` at level 45, the same undocumented level `powercfg.exe` uses internally, to read the raw power request list from the kernel. Native path strings are resolved via `NtQueryObject`; COM class names are looked up in the registry. The monitor runs on a background thread and posts state changes to the UI thread via `SynchronizationContext`.
+
+> [!NOTE]
+> Level 45 uses undocumented structure offsets verified against `powercfg /requests` output. A future Windows update could break parsing.
+
+## Changes from upstream
+
+- Native API (`PowerInformationWithPrivileges`) replaces `powercfg /requests` CLI parsing, removing process-spawn overhead on every poll
+- `SYSTEM` and `EXECUTION` category tracking added (upstream tracked `DISPLAY` only)
+- Kill action for process-backed blockers
+- Compact command-line display with PowerShell `-EncodedCommand` decode
+- Process candidate list when Windows reports a path without a PID
+- COM class name resolution for COM-hosted blockers
+- Sleep block test helper (`tests/sleep_block_test.ps1`)
+
+## Credits
+
+- [130cmWolf/WakeScope](https://github.com/130cmWolf/WakeScope): original display-sleep tray monitor this fork extends
 
 ## License
 
-MIT, original project by [130cmWolf/WakeScope](https://github.com/130cmWolf/WakeScope)
+[MIT](LICENSE)
