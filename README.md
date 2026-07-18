@@ -5,6 +5,7 @@
 [![Stars](https://img.shields.io/github/stars/nnyj/WakeScope?style=for-the-badge&labelColor=555&color=e3b341)](https://github.com/nnyj/WakeScope/stargazers)
 [![Downloads](https://img.shields.io/github/downloads/nnyj/WakeScope/total?style=for-the-badge&labelColor=555&color=2ea44f)](https://github.com/nnyj/WakeScope/releases)
 [![Latest Release](https://img.shields.io/github/v/release/nnyj/WakeScope?style=for-the-badge&label=Latest%20Release&labelColor=555&color=3572d6)](https://github.com/nnyj/WakeScope/releases/latest)
+[![Build](https://img.shields.io/github/actions/workflow/status/nnyj/WakeScope/release.yml?style=for-the-badge&labelColor=555)](https://github.com/nnyj/WakeScope/actions)
 
 </div>
 
