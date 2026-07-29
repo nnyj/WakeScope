@@ -1,7 +1,7 @@
 using System.Diagnostics;
-using System.Management;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.RegularExpressions;
 
 namespace WakeScope;
 
@@ -13,6 +13,7 @@ public sealed class PowerRequestEntry : IDisposable
     public required string Reason { get; init; }
     public required List<string> Categories { get; init; }
     public uint ProcessId { get; set; }
+    public string? ServiceName { get; init; }
     public Icon? Icon { get; init; }
     public string? ComClassName { get; set; }
     public string? CommandLine { get; set; }
@@ -31,6 +32,7 @@ public sealed class PowerRequestEntry : IDisposable
         {
             var parts = new List<string> { CategoryText };
             if (ProcessId != 0) parts.Add($"PID {ProcessId}");
+            if (!string.IsNullOrWhiteSpace(ServiceName)) parts.Add($"svc: {ServiceName}");
             if (!string.IsNullOrWhiteSpace(ComClassName)) parts.Add(ComClassName);
             if (!string.IsNullOrWhiteSpace(Reason)) parts.Add(Reason);
             return string.Join(" | ", parts);
@@ -64,16 +66,17 @@ public sealed class ProcessCandidate : IDisposable
     }
 }
 
-static class CommandLineFormatter
+static partial class CommandLineFormatter
 {
+    [GeneratedRegex(@"(?:-|/)e(?:ncodedcommand)?\s+(?<payload>[A-Za-z0-9+/=]+)", RegexOptions.IgnoreCase)]
+    private static partial Regex EncodedCommandRegex();
+
     public static string Summarize(string? commandLine)
     {
         if (string.IsNullOrWhiteSpace(commandLine)) return "";
 
         string summary = commandLine;
-        var encoded = System.Text.RegularExpressions.Regex.Match(
-            commandLine,
-            @"(?i)(?:-|/)e(?:ncodedcommand)?\s+(?<payload>[A-Za-z0-9+/=]+)");
+        var encoded = EncodedCommandRegex().Match(commandLine);
         if (encoded.Success)
         {
             summary = commandLine[..encoded.Index].Trim() + " -EncodedCommand <base64>";
@@ -86,9 +89,7 @@ static class CommandLineFormatter
     {
         if (string.IsNullOrWhiteSpace(commandLine)) return null;
 
-        var match = System.Text.RegularExpressions.Regex.Match(
-            commandLine,
-            @"(?i)(?:-|/)e(?:ncodedcommand)?\s+(?<payload>[A-Za-z0-9+/=]+)");
+        var match = EncodedCommandRegex().Match(commandLine);
         if (!match.Success) return null;
 
         try
@@ -112,15 +113,24 @@ static class CommandLineFormatter
     }
 }
 
-sealed class PowerRequestMonitor
+sealed partial class PowerRequestMonitor
 {
-    private const ulong TypeMarkerKernel = 0x12;
-    private const ulong TypeMarkerLegacy = 0x1E;
-    private const ulong TypeMarkerProcess = 0x3F;
-    private const ulong TypeMarkerExecutionProcess = 0x1000003F;
-    private const int OffProcessId = 0x38;
-    private const int OffStrings = 0x48;
-    private const int OffAltStrings = 0x68;
+    // Level 45 entry layout, verified on Windows 11 build 26100 against powercfg /requests.
+    // entry+0x00 dword SupportedRequestMask, entry+0x04..0x18 six dword active counts
+    //   (DISPLAY, SYSTEM, AWAYMODE, EXECUTION, PERFBOOST, ACTIVELOCKSCREEN).
+    // DIAGNOSTIC_BUFFER at entry+0x20: qword size, dword caller type @+0x08
+    //   (1 process, 2 shared service, else driver/kernel).
+    //   Process/service: qword image name offset @+0x10, dword pid @+0x18, dword service tag @+0x1C.
+    //   Driver: qword device description offset @+0x10, qword device path offset @+0x18.
+    //   qword reason offset @+0x20. Diagnostic string offsets are relative to the diagnostic buffer base.
+    // Reason struct: dword flags (1 simple string, 2 resource string), qword string/module offset @+0x08,
+    //   ushort resource id @+0x10, dword substitution string count @+0x14.
+    //   Reason string/module offsets are relative to the reason struct base, not the diagnostic buffer.
+    private const int DiagOffset       = 0x20;
+    private const int DiagHeaderSize   = 0x28;
+    private const int ReasonHeaderSize = 0x18;
+
+    private static readonly string[] BlockingCategories = ["DISPLAY", "SYSTEM", "AWAYMODE", "EXECUTION"];
 
     private readonly Icon _fallbackIcon;
 
@@ -137,24 +147,22 @@ sealed class PowerRequestMonitor
             {
                 if (native.Categories.Count == 0) continue;
 
-                string sourceType = native.TypeMarker is TypeMarkerProcess or TypeMarkerExecutionProcess
-                    ? "PROCESS" : "DRIVER";
-
-                string key = $"{sourceType}|{native.NativePath}|{native.Reason}";
+                string key = $"{native.SourceType}|{native.NativePath}|{native.Reason}|{native.ServiceName}";
 
                 if (!merged.TryGetValue(key, out var entry))
                 {
                     string? win32Path = NtPathConverter.ToWin32Path(native.NativePath);
-                    string displayName = GetDisplayName(sourceType, native.NativePath, win32Path);
 
                     entry = new PowerRequestEntry
                     {
-                        SourceType = sourceType,
+                        SourceType = native.SourceType,
                         NativePath = native.NativePath,
-                        DisplayName = displayName,
+                        DisplayName = native.DisplayName
+                            ?? GetDisplayName(native.SourceType, native.NativePath, win32Path),
                         Reason = native.Reason,
                         Categories = [],
                         ProcessId = native.ProcessId,
+                        ServiceName = native.ServiceName,
                         Icon = TryExtractIcon(win32Path) ?? new Icon(_fallbackIcon, 16, 16),
                     };
                     merged.Add(key, entry);
@@ -225,83 +233,108 @@ sealed class PowerRequestMonitor
 
     private static List<NativeRequestEntry> ParseNativeEntries(IntPtr buf, uint bufSize)
     {
-        ulong count = (ulong)Marshal.ReadInt64(buf, 0);
+        long count = Marshal.ReadInt64(buf, 0);
         var result = new List<NativeRequestEntry>();
 
-        for (ulong i = 0; i < count; i++)
+        for (long i = 0; i < count; i++)
         {
             int headerOff = 8 + (int)i * 8;
             if (headerOff + 8 > (int)bufSize) break;
 
-            ulong elemOff = (ulong)Marshal.ReadInt64(buf, headerOff);
-            if (elemOff + OffStrings + 2 > bufSize) continue;
+            long elemOff = Marshal.ReadInt64(buf, headerOff);
+            if (elemOff < 0 || elemOff + DiagOffset + DiagHeaderSize > bufSize) continue;
 
-            IntPtr elem = IntPtr.Add(buf, (int)elemOff);
-            ulong typeMarker = (ulong)Marshal.ReadInt64(elem, 0x00);
-            int stringOffset = typeMarker == TypeMarkerKernel ? OffAltStrings : OffStrings;
-            if (elemOff + (ulong)stringOffset + 2 > bufSize) continue;
-
-            int maxBytes = (int)(bufSize - elemOff) - stringOffset;
-            var (nativePath, reason) = ReadStringPair(elem, stringOffset, maxBytes);
-            if (string.IsNullOrWhiteSpace(nativePath) || !nativePath.Contains('\\')) continue;
-
-            result.Add(new NativeRequestEntry
-            {
-                TypeMarker = typeMarker,
-                ProcessId = ReadProcessId(typeMarker, elem),
-                NativePath = nativePath,
-                Reason = reason,
-                Categories = ReadNativeCategories(typeMarker, elem),
-            });
+            var entry = ParseEntry(buf, bufSize, (int)elemOff);
+            if (entry is not null) result.Add(entry);
         }
 
         return result;
     }
 
-    private static uint ReadProcessId(ulong typeMarker, IntPtr elem)
+    private static NativeRequestEntry? ParseEntry(IntPtr buf, uint bufSize, int elemOff)
     {
-        int value = Marshal.ReadInt32(elem, OffProcessId);
-        return value > 0 ? (uint)value : 0;
+        var categories = ReadCategories(buf, elemOff);
+        if (categories.Count == 0) return null;
+
+        int diag = elemOff + DiagOffset;
+        long diagSize = Marshal.ReadInt64(buf, diag);
+        if (diagSize < DiagHeaderSize || diag + diagSize > bufSize) return null;
+
+        int diagLimit = diag + (int)diagSize;
+        int callerType = Marshal.ReadInt32(buf, diag + 0x08);
+        string reason = ReadReason(buf, diag, diagLimit);
+
+        if (callerType is 1 or 2)
+        {
+            string imagePath = ReadStringAt(buf, diag, Marshal.ReadInt64(buf, diag + 0x10), diagLimit);
+            if (imagePath.Length == 0) return null;
+
+            uint processId = (uint)Marshal.ReadInt32(buf, diag + 0x18);
+            uint serviceTag = (uint)Marshal.ReadInt32(buf, diag + 0x1C);
+
+            return new NativeRequestEntry
+            {
+                SourceType = "PROCESS",
+                ProcessId = processId,
+                NativePath = imagePath,
+                DisplayName = null,
+                Reason = reason,
+                ServiceName = NativeProcessInfo.GetServiceNameFromTag(processId, serviceTag),
+                Categories = categories,
+            };
+        }
+
+        string description = ReadStringAt(buf, diag, Marshal.ReadInt64(buf, diag + 0x10), diagLimit);
+        string devicePath = ReadStringAt(buf, diag, Marshal.ReadInt64(buf, diag + 0x18), diagLimit);
+        if (description.Length == 0 && devicePath.Length == 0) return null;
+
+        return new NativeRequestEntry
+        {
+            SourceType = "DRIVER",
+            ProcessId = 0,
+            NativePath = devicePath.Length > 0 ? devicePath : description,
+            DisplayName = description.Length > 0 ? description : devicePath,
+            Reason = reason,
+            ServiceName = null,
+            Categories = categories,
+        };
     }
 
-    private static List<string> ReadNativeCategories(ulong typeMarker, IntPtr elem)
+    private static List<string> ReadCategories(IntPtr buf, int elemOff)
     {
-        ulong f1 = (ulong)Marshal.ReadInt64(elem, 0x08);
-        ulong f2 = (ulong)Marshal.ReadInt64(elem, 0x10);
-        ulong f5 = (ulong)Marshal.ReadInt64(elem, 0x28);
         var categories = new List<string>();
-
-        if (typeMarker == TypeMarkerProcess)
+        for (int i = 0; i < BlockingCategories.Length; i++)
         {
-            if (f2 != 0) categories.Add("DISPLAY");
-            if (f1 != 0) categories.Add("SYSTEM");
+            if (Marshal.ReadInt32(buf, elemOff + 0x04 + i * 4) > 0)
+                categories.Add(BlockingCategories[i]);
         }
-        else if (typeMarker == TypeMarkerExecutionProcess)
-        {
-            if (f5 != 0) categories.Add("EXECUTION");
-        }
-        // kernel/legacy entries are registrations, not active blockers — skip
-
         return categories;
     }
 
-    private static (string first, string second) ReadStringPair(
-        IntPtr elem, int startOffset, int maxBytes)
+    private static string ReadReason(IntPtr buf, int diag, int diagLimit)
     {
-        int limit = startOffset + maxBytes;
-        int offset = startOffset;
-        string first = ReadNullTermWChar(elem, ref offset, limit);
-        string second = ReadNullTermWChar(elem, ref offset, limit);
-        return (first, second);
+        long reasonOff = Marshal.ReadInt64(buf, diag + 0x20);
+        if (reasonOff <= 0 || diag + reasonOff + ReasonHeaderSize > diagLimit) return "";
+
+        int reason = diag + (int)reasonOff;
+        int flags = Marshal.ReadInt32(buf, reason);
+        if (flags is not (1 or 2)) return "";
+
+        string text = ReadStringAt(buf, reason, Marshal.ReadInt64(buf, reason + 0x08), diagLimit);
+        if (flags == 1 || text.Length == 0) return text;
+
+        ushort resourceId = (ushort)Marshal.ReadInt16(buf, reason + 0x10);
+        return NativeResourceString.Load(text, resourceId) ?? $"{text}: {resourceId}";
     }
 
-    private static string ReadNullTermWChar(IntPtr elem, ref int byteOffset, int limit)
+    private static string ReadStringAt(IntPtr buf, int diag, long relativeOffset, int diagLimit)
     {
+        if (relativeOffset <= 0 || diag + relativeOffset + 2 > diagLimit) return "";
+
         var sb = new StringBuilder();
-        while (byteOffset + 1 < limit)
+        for (int p = diag + (int)relativeOffset; p + 2 <= diagLimit; p += 2)
         {
-            short w = Marshal.ReadInt16(elem, byteOffset);
-            byteOffset += 2;
+            short w = Marshal.ReadInt16(buf, p);
             if (w == 0) break;
             sb.Append((char)w);
         }
@@ -323,9 +356,8 @@ sealed class PowerRequestMonitor
 
         if (entry.ProcessId == 0) return;
 
-        entry.CommandLine = TryGetCommandLine(entry.ProcessId);
+        entry.CommandLine = NativeProcessInfo.GetCommandLine(entry.ProcessId);
         entry.ComClassName = TryGetComClassName(entry.CommandLine);
-
     }
 
     private static List<ProcessCandidate> FindProcessesByPath(string? win32Path)
@@ -350,7 +382,7 @@ sealed class PowerRequestMonitor
                         {
                             ProcessId = (uint)proc.Id,
                             ProcessName = Path.GetFileName(modulePath),
-                            CommandLine = TryGetCommandLine((uint)proc.Id),
+                            CommandLine = NativeProcessInfo.GetCommandLine((uint)proc.Id),
                             Icon = TryExtractIcon(modulePath),
                         });
                     }
@@ -367,31 +399,14 @@ sealed class PowerRequestMonitor
         }
     }
 
-    private static string? TryGetCommandLine(uint processId)
-    {
-        try
-        {
-            using var searcher = new ManagementObjectSearcher(
-                $"SELECT CommandLine FROM Win32_Process WHERE ProcessId = {processId}");
-            using ManagementObjectCollection results = searcher.Get();
-            return results.Cast<ManagementObject>()
-                .Select(static x => x["CommandLine"]?.ToString())
-                .FirstOrDefault(static x => !string.IsNullOrWhiteSpace(x));
-        }
-        catch
-        {
-            return null;
-        }
-    }
+    [GeneratedRegex(@"/Processid:\{(?<id>[0-9a-fA-F\-]+)\}", RegexOptions.IgnoreCase)]
+    private static partial Regex ComProcessIdRegex();
 
     private static string? TryGetComClassName(string? commandLine)
     {
         if (string.IsNullOrWhiteSpace(commandLine)) return null;
 
-        var match = System.Text.RegularExpressions.Regex.Match(
-            commandLine,
-            @"/Processid:\{(?<id>[0-9a-fA-F\-]+)\}",
-            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        var match = ComProcessIdRegex().Match(commandLine);
         if (!match.Success) return null;
 
         string clsid = "{" + match.Groups["id"].Value + "}";
@@ -422,10 +437,12 @@ sealed class PowerRequestMonitor
 
     private sealed class NativeRequestEntry
     {
-        public required ulong TypeMarker { get; init; }
+        public required string SourceType { get; init; }
         public required uint ProcessId { get; init; }
         public required string NativePath { get; init; }
+        public required string? DisplayName { get; init; }
         public required string Reason { get; init; }
+        public required string? ServiceName { get; init; }
         public required List<string> Categories { get; init; }
     }
 }

@@ -5,8 +5,14 @@ namespace WakeScope;
 static class Program
 {
     [STAThread]
-    static void Main()
+    static void Main(string[] args)
     {
+        if (args.Length == 2 && args[0] == "--dump")
+        {
+            DumpBlockers(args[1]);
+            return;
+        }
+
         using var mutex = new Mutex(true, @"Global\WakeScope_SingleInstance", out bool created);
         if (!created)
         {
@@ -32,5 +38,18 @@ static class Program
 
         using var app = new TrayApp();
         Application.Run(app);
+    }
+
+    private static void DumpBlockers(string outputPath)
+    {
+        NativePower.EnablePrivilege("SeShutdownPrivilege");
+        NativePower.EnablePrivilege("SeDebugPrivilege");
+
+        using var fallbackIcon = new Icon(SystemIcons.Application, 16, 16);
+        var blockers = new PowerRequestMonitor(fallbackIcon).GetBlockers();
+        File.WriteAllLines(outputPath, blockers.Select(static x => string.Join(" | ",
+            x.SourceType, x.CategoryText, x.ProcessId, x.DisplayName, x.NativePath, x.Reason, x.ServiceName ?? "")));
+
+        foreach (var entry in blockers) entry.Dispose();
     }
 }

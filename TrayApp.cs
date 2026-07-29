@@ -19,6 +19,7 @@ sealed class TrayApp : ApplicationContext
     private readonly SynchronizationContext _syncContext;
     private readonly CancellationTokenSource _cts = new();
     private readonly ContextMenuStrip _menu = new();
+    private readonly Font _menuFont = new("Segoe UI", 9F, FontStyle.Regular, GraphicsUnit.Point);
     private List<PowerRequestEntry> _blockers = [];
 
     public TrayApp()
@@ -32,7 +33,7 @@ sealed class TrayApp : ApplicationContext
         _syncContext = SynchronizationContext.Current
             ?? throw new InvalidOperationException("SynchronizationContext is null on UI thread.");
 
-        _menu.Font = new Font("Segoe UI", 9F, FontStyle.Regular, GraphicsUnit.Point);
+        _menu.Font = _menuFont;
         _menu.ImageScalingSize = new Size(16, 16);
         _menu.Opening += RebuildMenuOnOpening;
         _blockers = _monitor.GetBlockers();
@@ -163,6 +164,9 @@ sealed class TrayApp : ApplicationContext
         }
 
         _menu.Items.Add(new ToolStripSeparator());
+        _menu.Items.Add(BuildSleepTimeoutMenu());
+
+        _menu.Items.Add(new ToolStripSeparator());
 
         var refreshItem = new ToolStripMenuItem("Refresh");
         refreshItem.Click += (_, _) => Task.Run(RefreshBlockers);
@@ -240,6 +244,55 @@ sealed class TrayApp : ApplicationContext
         }
     }
 
+    private static readonly (string Label, uint Seconds)[] SleepTimeoutPresets =
+    [
+        ("15 min", 900), ("30 min", 1800), ("45 min", 2700),
+        ("1 h", 3600), ("2 h", 7200), ("3 h", 10800), ("4 h", 14400), ("5 h", 18000),
+        ("Never", 0),
+    ];
+
+    private static ToolStripMenuItem BuildSleepTimeoutMenu()
+    {
+        var current = NativePower.GetStandbyTimeout();
+        string label = current is null
+            ? "Sleep timeout: unavailable"
+            : $"Sleep timeout: {FormatTimeout(current.Value.Ac)}"
+              + (current.Value.Ac == current.Value.Dc ? "" : " (AC)");
+
+        var root = new ToolStripMenuItem(label) { Enabled = current is not null };
+
+        foreach (var (presetLabel, seconds) in SleepTimeoutPresets)
+        {
+            var item = new ToolStripMenuItem(presetLabel)
+            {
+                Checked = current is not null && current.Value.Ac == seconds,
+            };
+            item.Click += (_, _) => ApplySleepTimeout(presetLabel, seconds);
+            root.DropDownItems.Add(item);
+        }
+
+        return root;
+    }
+
+    private static string FormatTimeout(uint seconds)
+    {
+        if (seconds == 0) return "never";
+        if (seconds % 3600 == 0) return $"{seconds / 3600} h";
+        return $"{seconds / 60} min";
+    }
+
+    private static void ApplySleepTimeout(string label, uint seconds)
+    {
+        uint status = NativePower.SetStandbyTimeout(seconds);
+        if (status == 0) return;
+
+        MessageBox.Show(
+            $"Could not set sleep timeout to {label}.\n\nWin32 error {status}.",
+            "WakeScope",
+            MessageBoxButtons.OK,
+            MessageBoxIcon.Error);
+    }
+
     private static Bitmap? ToMenuBitmap(Icon? icon)
     {
         if (icon is null) return null;
@@ -258,7 +311,7 @@ sealed class TrayApp : ApplicationContext
 
         try
         {
-            using var proc = System.Diagnostics.Process.GetProcessById((int)processId);
+            using var proc = Process.GetProcessById((int)processId);
             proc.Kill();
             proc.WaitForExit(2000);
         }
@@ -286,6 +339,7 @@ sealed class TrayApp : ApplicationContext
             foreach (ToolStripItem item in _menu.Items)
                 DisposeMenuItemImages(item);
             _menu.Dispose();
+            _menuFont.Dispose();
 
             foreach (var entry in _blockers) entry.Dispose();
             _idleIcon.Dispose();
@@ -310,9 +364,6 @@ sealed class TrayApp : ApplicationContext
 
     private void ShowTrayMenu()
     {
-        ApplyBlockers(_monitor.GetBlockers());
-        RebuildMenu();
-
         var method = typeof(NotifyIcon)
             .GetMethod("ShowContextMenu", BindingFlags.Instance | BindingFlags.NonPublic);
         if (method is not null)

@@ -20,7 +20,10 @@ Windows system tray tool that identifies active power requests blocking display 
 - Decodes PowerShell `-EncodedCommand` for readable command-line display
 - Lists all matching processes when Windows reports a path without a PID
 - Kill option for process-backed blockers from the tray menu
-- Reports driver and kernel blockers (cannot kill, Windows exposes no PID)
+- Shows the active power plan sleep timeout and sets it from the tray menu via native `powrprof` API
+- Detects legacy `SetThreadExecutionState` callers such as video players, not only `PowerCreateRequest` clients
+- Reports driver and kernel blockers with device names and localized reason strings (cannot kill, Windows exposes no PID)
+- Resolves the owning service name for blockers hosted in a shared `svchost.exe`
 - Single instance enforced via global mutex
 - Requires administrator, UAC prompt on launch
 
@@ -58,19 +61,20 @@ powershell -ExecutionPolicy Bypass -File .\tests\sleep_block_test.ps1
 
 ## How it works
 
-WakeScope calls `PowerInformationWithPrivileges` at level 45, the same undocumented level `powercfg.exe` uses internally, to read the raw power request list from the kernel. Native path strings are resolved via `NtQueryObject`; COM class names are looked up in the registry. The monitor runs on a background thread and posts state changes to the UI thread via `SynchronizationContext`.
+WakeScope calls `PowerInformationWithPrivileges` at level 45, the same undocumented level `powercfg.exe` uses internally, to read the raw power request list from the kernel. Each entry carries per-category active counts and a diagnostic buffer naming the caller (process image path and PID, shared service tag, or device description and path) plus a reason that is either a plain string or a module and resource id resolved through `LoadStringW`. Native path strings are resolved via `NtQueryObject`; COM class names are looked up in the registry. The monitor runs on a background thread and posts state changes to the UI thread via `SynchronizationContext`.
 
 > [!NOTE]
-> Level 45 uses undocumented structure offsets verified against `powercfg /requests` output. A future Windows update could break parsing.
+> Level 45 uses undocumented structure offsets, verified on build 26100 against controlled dumps of both `PowerCreateRequest` and `SetThreadExecutionState` blockers and cross-checked with `powercfg /requests`. A future Windows update could break parsing.
 
 ## Changes from upstream
 
 - Native API (`PowerInformationWithPrivileges`) replaces `powercfg /requests` CLI parsing, removing process-spawn overhead on every poll
-- `SYSTEM` and `EXECUTION` category tracking added (upstream tracked `DISPLAY` only)
+- `SYSTEM`, `AWAYMODE` and `EXECUTION` category tracking added (upstream tracked `DISPLAY` only)
 - Kill action for process-backed blockers
 - Compact command-line display with PowerShell `-EncodedCommand` decode
 - Process candidate list when Windows reports a path without a PID
 - COM class name resolution for COM-hosted blockers
+- Sleep timeout submenu reading and writing the active power plan without spawning `powercfg`
 - Sleep block test helper (`tests/sleep_block_test.ps1`)
 
 ## Credits

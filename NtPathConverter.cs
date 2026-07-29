@@ -8,8 +8,8 @@ static class NtPathConverter
     private static extern uint QueryDosDevice(string lpDeviceName, char[] lpTargetPath, uint ucchMax);
 
     /// <summary>
-    /// \Device\HarddiskVolumeX\... 形式の NT パスを Win32 パス (C:\...) に変換する。
-    /// 変換できなければ null を返す。
+    /// Converts an NT path of the form \Device\HarddiskVolumeX\... to a Win32 path (C:\...).
+    /// Returns null when no conversion is possible.
     /// </summary>
     public static string? ToWin32Path(string ntPath)
     {
@@ -21,7 +21,7 @@ static class NtPathConverter
             uint written = QueryDosDevice(drive, buf, (uint)buf.Length);
             if (written == 0) continue;
 
-            // QueryDosDevice は複数の null 終端文字列を返す場合がある。先頭だけ使う。
+            // QueryDosDevice can return several null-terminated strings; only the first one is used.
             int nullIdx = Array.IndexOf(buf, '\0');
             string device = nullIdx >= 0 ? new string(buf, 0, nullIdx) : new string(buf);
 
