@@ -15,6 +15,8 @@ Windows system tray tool that identifies active power requests blocking display 
 
 - Polls every 2 s via native `PowerInformationWithPrivileges` API, no process spawn per tick
 - Color-coded tray icon: gray (no blockers), orange (display-only blocker), red (any sleep blocker)
+- Tray icon glyph shows the sleep timeout: `1` to `9` for whole hours, `N` for never, blank for minute presets
+- Tray icon rendered at the DPI-scaled system small icon size
 - Groups blockers by `Display` and `Sleep` category
 - Shows process name, PID, reason string, COM class name where available
 - Decodes PowerShell `-EncodedCommand` for readable command-line display

@@ -11,9 +11,8 @@ sealed class TrayApp : ApplicationContext
     private static extern bool DestroyIcon(IntPtr hIcon);
 
     private readonly NotifyIcon _trayIcon;
-    private readonly Icon _idleIcon;
-    private readonly Icon _displayOnlyIcon;
-    private readonly Icon _blockedIcon;
+    private Icon? _currentIcon;
+    private (Color Fill, string? Glyph)? _currentIconKey;
     private readonly Icon _fallbackIcon;
     private readonly PowerRequestMonitor _monitor;
     private readonly SynchronizationContext _syncContext;
@@ -24,9 +23,6 @@ sealed class TrayApp : ApplicationContext
 
     public TrayApp()
     {
-        _idleIcon = CreateStatusIcon(Color.FromArgb(90, 90, 90));
-        _displayOnlyIcon = CreateStatusIcon(Color.FromArgb(242, 153, 74));
-        _blockedIcon = CreateStatusIcon(Color.FromArgb(224, 67, 54), true);
         _fallbackIcon = new Icon(SystemIcons.Application, 16, 16);
 
         _monitor = new PowerRequestMonitor(_fallbackIcon);
@@ -41,7 +37,7 @@ sealed class TrayApp : ApplicationContext
 
         _trayIcon = new NotifyIcon
         {
-            Icon = _idleIcon,
+            Icon = _fallbackIcon,
             Text = "WakeScope: no blockers",
             Visible = true,
             ContextMenuStrip = _menu,
@@ -56,28 +52,32 @@ sealed class TrayApp : ApplicationContext
         _ = Task.Run(() => RunMonitorLoop(_cts.Token));
     }
 
-    private static Icon CreateStatusIcon(Color fill, bool blocked = false)
+    private static Icon CreateStatusIcon(Color fill, string? glyph)
     {
-        using var bitmap = new Bitmap(16, 16);
+        // tray expects SM_CXSMICON px (16 at 100%, 24 at 150%), a fixed 16 renders undersized on scaled DPI
+        int size = Math.Max(16, SystemInformation.SmallIconSize.Width);
+        float scale = size / 16f;
+        using var bitmap = new Bitmap(size, size);
         using Graphics graphics = Graphics.FromImage(bitmap);
         graphics.Clear(Color.Transparent);
         graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
 
-        using var borderBrush = new SolidBrush(Color.FromArgb(34, 34, 34));
         using var fillBrush = new SolidBrush(fill);
-        graphics.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.Half;
-        graphics.FillEllipse(borderBrush, 0, 0, 16, 16);
-        graphics.FillEllipse(fillBrush, 1.5f, 1.5f, 13, 13);
+        graphics.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.HighQuality;
+        graphics.FillEllipse(fillBrush, 0, 0, size - 1, size - 1);
 
-        if (blocked)
+        if (glyph is not null)
         {
-            using var glyphPen = new Pen(Color.White, 2)
-            {
-                StartCap = System.Drawing.Drawing2D.LineCap.Round,
-                EndCap = System.Drawing.Drawing2D.LineCap.Round,
-            };
-            graphics.DrawLine(glyphPen, 8, 4.5f, 8, 9.2f);
-            graphics.DrawLine(glyphPen, 8, 11.8f, 8, 11.9f);
+            // GraphicsPath bounds centre the ink itself, DrawString centres the em box and sits low-left
+            using var path = new System.Drawing.Drawing2D.GraphicsPath();
+            path.AddString(glyph, new FontFamily("Segoe UI"), (int)FontStyle.Bold, 12 * scale,
+                PointF.Empty, StringFormat.GenericTypographic);
+            RectangleF bounds = path.GetBounds();
+            float centre = (size - 1) / 2f;
+            using var shift = new System.Drawing.Drawing2D.Matrix();
+            shift.Translate(centre - bounds.X - bounds.Width / 2f, centre - bounds.Y - bounds.Height / 2f);
+            path.Transform(shift);
+            graphics.FillPath(Brushes.White, path);
         }
         IntPtr handle = bitmap.GetHicon();
         try
@@ -127,14 +127,32 @@ sealed class TrayApp : ApplicationContext
         bool display = _blockers.Any(static x => x.BlocksDisplay);
         bool sleep = _blockers.Any(static x => x.BlocksSleep);
 
-        _trayIcon.Icon = (display, sleep) switch
+        Color fill = (display, sleep) switch
         {
-            (_, true) => _blockedIcon,
-            (true, false) => _displayOnlyIcon,
-            _ => _idleIcon,
+            (_, true) => Color.FromArgb(224, 67, 54),
+            (true, false) => Color.FromArgb(242, 153, 74),
+            _ => Color.FromArgb(90, 90, 90),
         };
+        (Color Fill, string? Glyph) key = (fill, GetTimeoutGlyph(NativePower.GetStandbyTimeout()?.Ac));
+        if (_currentIconKey != key)
+        {
+            Icon? previous = _currentIcon;
+            _currentIcon = CreateStatusIcon(key.Fill, key.Glyph);
+            _currentIconKey = key;
+            _trayIcon.Icon = _currentIcon;
+            previous?.Dispose();
+        }
 
         _trayIcon.Text = GetTooltip(display, sleep);
+    }
+
+    private static string? GetTimeoutGlyph(uint? acSeconds)
+    {
+        if (acSeconds is null) return null;
+        if (acSeconds == 0) return "N";
+        if (acSeconds % 3600 != 0) return null;
+        uint hours = acSeconds.Value / 3600;
+        return hours is >= 1 and <= 9 ? hours.ToString() : null;
     }
 
     private string GetTooltip(bool display, bool sleep)
@@ -251,7 +269,7 @@ sealed class TrayApp : ApplicationContext
         ("Never", 0),
     ];
 
-    private static ToolStripMenuItem BuildSleepTimeoutMenu()
+    private ToolStripMenuItem BuildSleepTimeoutMenu()
     {
         var current = NativePower.GetStandbyTimeout();
         string label = current is null
@@ -281,10 +299,14 @@ sealed class TrayApp : ApplicationContext
         return $"{seconds / 60} min";
     }
 
-    private static void ApplySleepTimeout(string label, uint seconds)
+    private void ApplySleepTimeout(string label, uint seconds)
     {
         uint status = NativePower.SetStandbyTimeout(seconds);
-        if (status == 0) return;
+        if (status == 0)
+        {
+            UpdateTrayState();
+            return;
+        }
 
         MessageBox.Show(
             $"Could not set sleep timeout to {label}.\n\nWin32 error {status}.",
@@ -342,9 +364,7 @@ sealed class TrayApp : ApplicationContext
             _menuFont.Dispose();
 
             foreach (var entry in _blockers) entry.Dispose();
-            _idleIcon.Dispose();
-            _displayOnlyIcon.Dispose();
-            _blockedIcon.Dispose();
+            _currentIcon?.Dispose();
             _fallbackIcon.Dispose();
         }
 
