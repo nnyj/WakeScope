@@ -20,6 +20,8 @@ sealed class TrayApp : ApplicationContext
     private readonly ContextMenuStrip _menu = new();
     private readonly Font _menuFont = new("Segoe UI", 9F, FontStyle.Regular, GraphicsUnit.Point);
     private List<PowerRequestEntry> _blockers = [];
+    private DateTime? _keepAwakeUntil;
+    private static readonly uint SelfProcessId = (uint)Environment.ProcessId;
 
     public TrayApp()
     {
@@ -31,6 +33,7 @@ sealed class TrayApp : ApplicationContext
 
         _menu.Font = _menuFont;
         _menu.ImageScalingSize = new Size(16, 16);
+        ToolStripManager.Renderer = new CheckMarkRenderer();
         _menu.Opening += RebuildMenuOnOpening;
         _blockers = _monitor.GetBlockers();
         RebuildMenu();
@@ -124,13 +127,18 @@ sealed class TrayApp : ApplicationContext
 
     private void UpdateTrayState()
     {
-        bool display = _blockers.Any(static x => x.BlocksDisplay);
-        bool sleep = _blockers.Any(static x => x.BlocksSleep);
+        if (_keepAwakeUntil <= DateTime.UtcNow) _keepAwakeUntil = null;
+        // re-applied every poll so the request holds after resume
+        NativePower.SetKeepAwake(_keepAwakeUntil is not null);
 
-        Color fill = (display, sleep) switch
+        bool display = _blockers.Any(static x => x.BlocksDisplay);
+        bool sleep = _blockers.Any(static x => x.BlocksSleep && x.ProcessId != SelfProcessId);
+
+        Color fill = (display, sleep, _keepAwakeUntil is not null) switch
         {
-            (_, true) => Color.FromArgb(224, 67, 54),
-            (true, false) => Color.FromArgb(242, 153, 74),
+            (_, true, _) => Color.FromArgb(224, 67, 54),
+            (_, _, true) => Color.FromArgb(52, 120, 220),
+            (true, _, _) => Color.FromArgb(242, 153, 74),
             _ => Color.FromArgb(90, 90, 90),
         };
         (Color Fill, string? Glyph) key = (fill, GetTimeoutGlyph(NativePower.GetStandbyTimeout()?.Ac));
@@ -157,11 +165,13 @@ sealed class TrayApp : ApplicationContext
 
     private string GetTooltip(bool display, bool sleep)
     {
-        if (!display && !sleep) return "WakeScope: no blockers";
-
         int displayCount = _blockers.Count(static x => x.BlocksDisplay);
-        int sleepCount = _blockers.Count(static x => x.BlocksSleep);
-        string text = $"WakeScope: display {displayCount}, sleep {sleepCount}";
+        int sleepCount = _blockers.Count(static x => x.BlocksSleep && x.ProcessId != SelfProcessId);
+        string text = display || sleep
+            ? $"WakeScope: display {displayCount}, sleep {sleepCount}"
+            : "WakeScope: no blockers";
+        if (_keepAwakeUntil is { } until)
+            text += $", keep awake {FormatRemaining(until - DateTime.UtcNow)}";
         return text.Length <= 63 ? text : text[..63];
     }
 
@@ -182,6 +192,7 @@ sealed class TrayApp : ApplicationContext
         }
 
         _menu.Items.Add(new ToolStripSeparator());
+        _menu.Items.Add(BuildKeepAwakeMenu());
         _menu.Items.Add(BuildSleepTimeoutMenu());
 
         _menu.Items.Add(new ToolStripSeparator());
@@ -247,7 +258,11 @@ sealed class TrayApp : ApplicationContext
                 }
             }
 
-            if (entry.ProcessId != 0)
+            if (entry.ProcessId == SelfProcessId)
+            {
+                item.DropDownItems.Add(BuildKeepAwakeOffItem());
+            }
+            else if (entry.ProcessId != 0)
             {
                 var killItem = new ToolStripMenuItem("Kill process");
                 killItem.Click += (_, _) => KillProcess(entry.ProcessId, entry.DisplayName);
@@ -260,6 +275,54 @@ sealed class TrayApp : ApplicationContext
 
             _menu.Items.Add(item);
         }
+    }
+
+    private static readonly (string Label, TimeSpan Duration)[] KeepAwakePresets =
+    [
+        ("30 min", TimeSpan.FromMinutes(30)), ("2 h", TimeSpan.FromHours(2)), ("8 h", TimeSpan.FromHours(8)),
+        ("1 d", TimeSpan.FromDays(1)), ("3 d", TimeSpan.FromDays(3)), ("7 d", TimeSpan.FromDays(7)),
+    ];
+
+    private ToolStripMenuItem BuildKeepAwakeMenu()
+    {
+        string label = _keepAwakeUntil is { } until
+            ? $"Keep awake: {FormatRemaining(until - DateTime.UtcNow)} left"
+            : "Keep awake: off";
+
+        var root = new ToolStripMenuItem(label);
+        if (_keepAwakeUntil is not null) root.DropDownItems.Add(BuildKeepAwakeOffItem());
+
+        foreach (var (presetLabel, duration) in KeepAwakePresets)
+        {
+            var item = new ToolStripMenuItem(presetLabel);
+            item.Click += (_, _) => SetKeepAwake(DateTime.UtcNow + duration);
+            root.DropDownItems.Add(item);
+        }
+
+        return root;
+    }
+
+    private ToolStripMenuItem BuildKeepAwakeOffItem()
+    {
+        var item = new ToolStripMenuItem("Off");
+        item.Click += (_, _) => SetKeepAwake(null);
+        return item;
+    }
+
+    private void SetKeepAwake(DateTime? until)
+    {
+        _keepAwakeUntil = until;
+        UpdateTrayState();
+        Task.Run(RefreshBlockers);
+    }
+
+    private static string FormatRemaining(TimeSpan left)
+    {
+        int minutes = Math.Max(1, (int)Math.Ceiling(left.TotalMinutes));
+        if (minutes < 60) return $"{minutes} min";
+        int hours = minutes / 60;
+        if (hours < 24) return minutes % 60 == 0 ? $"{hours} h" : $"{hours} h {minutes % 60} min";
+        return hours % 24 == 0 ? $"{hours / 24} d" : $"{hours / 24} d {hours % 24} h";
     }
 
     private static readonly (string Label, uint Seconds)[] SleepTimeoutPresets =
@@ -399,5 +462,23 @@ sealed class TrayApp : ApplicationContext
     {
         ApplyBlockers(_monitor.GetBlockers());
         RebuildMenu();
+    }
+}
+
+sealed class CheckMarkRenderer : ToolStripProfessionalRenderer
+{
+    // default check glyph renders as a tiny box on scaled DPI, draw the tick by hand
+    protected override void OnRenderItemCheck(ToolStripItemImageRenderEventArgs e)
+    {
+        Rectangle box = e.ImageRectangle;
+        float scale = box.Width / 16f;
+        e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+        using var pen = new Pen(e.Item.ForeColor, 1.6f * scale);
+        e.Graphics.DrawLines(pen,
+        [
+            new PointF(box.X + 3 * scale, box.Y + 8.5f * scale),
+            new PointF(box.X + 6.5f * scale, box.Y + 12 * scale),
+            new PointF(box.X + 13 * scale, box.Y + 4.5f * scale),
+        ]);
     }
 }

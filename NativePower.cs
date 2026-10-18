@@ -77,6 +77,18 @@ static class NativePower
         return PowerSetActiveScheme(IntPtr.Zero, ref scheme);
     }
 
+    // ── Keep awake ───────────────────────────────────────────────────────────
+
+    private const uint EsContinuous     = 0x80000000;
+    private const uint EsSystemRequired = 0x00000001;
+
+    [DllImport("kernel32.dll")]
+    private static extern uint SetThreadExecutionState(uint flags);
+
+    /// <summary>State belongs to the calling thread, so call only from the UI thread.</summary>
+    internal static void SetKeepAwake(bool on) =>
+        SetThreadExecutionState(on ? EsContinuous | EsSystemRequired : EsContinuous);
+
     private static bool TryGetActiveScheme(out Guid scheme)
     {
         scheme = Guid.Empty;

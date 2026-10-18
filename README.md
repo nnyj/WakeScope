@@ -14,7 +14,7 @@ Windows system tray tool that identifies active power requests blocking display 
 ## Features
 
 - Polls every 2 s via native `PowerInformationWithPrivileges` API, no process spawn per tick
-- Color-coded tray icon: gray (no blockers), orange (display-only blocker), red (any sleep blocker)
+- Color-coded tray icon: gray (no blockers), orange (display-only blocker), blue (keep awake on, no other sleep blocker), red (any other sleep blocker)
 - Tray icon glyph shows the sleep timeout: `1` to `9` for whole hours, `N` for never, blank for minute presets
 - Tray icon rendered at the DPI-scaled system small icon size
 - Groups blockers by `Display` and `Sleep` category
@@ -22,6 +22,7 @@ Windows system tray tool that identifies active power requests blocking display 
 - Decodes PowerShell `-EncodedCommand` for readable command-line display
 - Lists all matching processes when Windows reports a path without a PID
 - Kill option for process-backed blockers from the tray menu
+- Keep awake menu blocks system sleep for 30 min to 7 d via `SetThreadExecutionState`, display can still turn off, released on exit
 - Shows the active power plan sleep timeout and sets it from the tray menu via native `powrprof` API
 - Detects legacy `SetThreadExecutionState` callers such as video players, not only `PowerCreateRequest` clients
 - Reports driver and kernel blockers with device names and localized reason strings (cannot kill, Windows exposes no PID)
@@ -76,6 +77,7 @@ WakeScope calls `PowerInformationWithPrivileges` at level 45, the same undocumen
 - Compact command-line display with PowerShell `-EncodedCommand` decode
 - Process candidate list when Windows reports a path without a PID
 - COM class name resolution for COM-hosted blockers
+- Keep awake submenu with timed presets
 - Sleep timeout submenu reading and writing the active power plan without spawning `powercfg`
 - Sleep block test helper (`tests/sleep_block_test.ps1`)
 
